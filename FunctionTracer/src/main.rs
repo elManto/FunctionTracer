@@ -5,7 +5,7 @@ use std::io::BufReader;
 use std::collections::HashMap;
 use nix::sys::ptrace;
 use nix::unistd::{execv, Pid, fork, ForkResult};
-use nix::sys::wait::{waitpid, wait};
+use nix::sys::wait::{waitpid, wait, WaitStatus};
 use nix::sys::signal::Signal;
 use std::ffi::CString;
 extern crate linux_personality;
@@ -39,7 +39,6 @@ fn elfParser(target: &String) -> HashMap<String, u64> {
 
 
 fn setBreakpoint(pid: Pid, addr: u64) -> i64 {
-		println!("Setting break at addr -> {}" , addr);
     let value = ptrace::read(pid, addr as *mut c_void).expect("Error reading memory");
     let bp = (value & (i64::MAX ^ 0xFF)) | 0xCC;
     unsafe {
@@ -48,98 +47,109 @@ fn setBreakpoint(pid: Pid, addr: u64) -> i64 {
     value
 }
 
-//fn restore_breakpoint(pid: Pid, addr: u64, orig_value: i64) {
-//    unsafe {
-//        // Restore original bytecode
-//        ptrace::write(pid, addr as *mut c_void, orig_value as *mut c_void).unwrap();
-//    }
-//}
-//
+fn restore_breakpoint(pid: Pid, addr: u64, orig_value: i64) {
+    unsafe {
+        // Restore original bytecode
+        ptrace::write(pid, addr as *mut c_void, orig_value as *mut c_void).unwrap();
+    }
+}
+
 //fn handle_sigstop(pid: Pid, saved_values: &HashMap<u64, i64>) {
-//    let mut regs = ptrace::getregs(pid).unwrap();
-//    println!("Hit breakpoint at 0x{:x}", regs.rip - 1);
-//
-//    match saved_values.get(&(regs.rip - 1)) {
-//        Some(orig) => {
-//            restore_breakpoint(pid, regs.rip - 1, *orig);
-//
-//            // rewind rip
-//            regs.rip -= 1;
-//            ptrace::setregs(pid, regs).expect("Error rewinding RIP");
-//
-//        }
-//        _ => print!("Nothing saved here"),
-//    }
-//
-//    ptrace::cont(pid, None).expect("Restoring breakpoint failed");
-//
-//}
-//
-//
-//fn eventsManager() {
-//	loop {
-//		match wait() {
-//	  	Ok(WaitStatus::Stopped(pid_t, sig_num)) => {
-//	    	match sig_num {
-//	      	Signal::SIGTRAP => {
-//	        	handle_sigstop(pid_t, &saved_values);
-//	        }
-//	                    
-//	        Signal::SIGSEGV => {
-//	        	let regs = ptrace::getregs(pid_t).unwrap();
-//	          println!("Segmentation fault at 0x{:x}", regs.rip);
-//	          break
-//	        }
-//	        _ => {
-//	        	println!("Some other signal - {}", sig_num);
-//	          break
-//	        }
-//	      }
-//	    },
-//	
-//	    Ok(WaitStatus::Exited(pid, exit_status)) => {
-//	    	println!("Process with pid: {} exited with status {}", pid, exit_status);
-//	      break;
-//	    },
-//	
-//	    Ok(status) =>  {
-//	    	println!("Received status: {:?}", status);
-//	      ptrace::cont(pid, None).expect("Failed to deliver signal");
-//	    },
-//	
-//	    Err(err) => {
-//	    	println!("Some kind of error - {:?}",err);      
-//	    },
-//	  }
-//	}
-//}
+fn handle_sigstop(pid: Pid, addr: u64, val: i64) {
+    let mut regs = ptrace::getregs(pid).unwrap();
+
+		if (regs.rip - 1) == addr {
+
+    	println!("Hit breakpoint at 0x{:x}", regs.rip - 1);
+			restore_breakpoint(pid, regs.rip - 1, val);
+			regs.rip -= 1;
+			ptrace::setregs(pid, regs).expect("Error resetting RIP");
+		}
+    //match saved_values.get(&(regs.rip - 1)) {
+    //    Some(orig) => {
+    //        restore_breakpoint(pid, regs.rip - 1, *orig);
+
+    //        // rewind rip
+    //        regs.rip -= 1;
+    //        ptrace::setregs(pid, regs).expect("Error rewinding RIP");
+
+    //    }
+    //    _ => print!("Nothing saved here"),
+    //}
+
+    //ptrace::cont(pid, None).expect("Restoring breakpoint failed");
+    ptrace::step(pid, None);
+
+}
+
+
+fn eventsManager(pid: Pid, breakpointMainAddr: u64, valMainAddr: i64) {
+	let mut isMainHit: bool = false;
+	loop {
+		match wait() {
+	  	Ok(WaitStatus::Stopped(pid_t, sig_num)) => {
+	    	match sig_num {
+	      	Signal::SIGTRAP => {
+	        	//handle_sigstop(pid_t, &saved_values);
+	        	handle_sigstop(pid_t, breakpointMainAddr, valMainAddr);
+						if !isMainHit {
+							getLibraryCalls(pid);
+							isMainHit = true;
+						}
+	        }
+	                    
+	        Signal::SIGSEGV => {
+	        	let regs = ptrace::getregs(pid_t).unwrap();
+	          println!("Segmentation fault at 0x{:x}", regs.rip);
+	          break
+	        }
+	        _ => {
+	        	println!("Some other signal - {}", sig_num);
+	          break
+	        }
+	      }
+	    },
+	
+	    Ok(WaitStatus::Exited(pid, exit_status)) => {
+	    	println!("Process with pid: {} exited with status {}", pid, exit_status);
+	      break;
+	    },
+	
+	    Ok(status) =>  {
+	    	println!("Received status: {:?}", status);
+	      //ptrace::cont(pid, None).expect("Failed to deliver signal");
+  			ptrace::step(pid, None);
+	    },
+	
+	    Err(err) => {
+	    	println!("Some kind of error - {:?}",err);      
+	    },
+
+			_ => {
+				ptrace::step(pid, None);
+				// get rip and if it points to a call, extract the address, get the corresponding symbols and prints it
+			}
+	  }
+	}
+}
+
+fn getLibraryCalls(pid: Pid) {
+	getAddressSpace(pid);
+	// Here we construct a global structure that contains for each loaded library the range addresses and the offsets of the symbols
+}
+
 
 fn parentProcess(pid: Pid, mainOffset: u64) -> u32 {
 	waitpid(pid, None).unwrap();
 
 	// set BPs
   let baseAddr : u64 = getMainProcBaseAddr(&getAddressSpace(pid));
-	let mainBreakpoint: u64 = baseAddr; //+ mainOffset;
+	let mainBreakpoint: u64 = baseAddr + mainOffset;
+	let mainVal : i64 = setBreakpoint(pid, mainBreakpoint);
 
-  wait().unwrap();
-	setBreakpoint(pid, mainBreakpoint);
-	
-	ptrace::cont(pid, None).expect("Failed continue process");
-
-	wait().unwrap();	
-	    let mut regs = ptrace::getregs(pid).unwrap();
-    println!("Hit breakpoint at 0x{:x}", regs.rip - 1);
 
 	ptrace::cont(pid, None).expect("Failed continue process");
-	// Single step
-  //let mut i = 0;
-  //while i < 10 {
-  //  ptrace::step(pid, None);
-  //  wait().unwrap();
-  //  let mut regs = ptrace::getregs(pid).expect("get registers failed");
-  //  println!("{}", regs.rip);
-  //  i = i + 1;
-  //}
+	eventsManager(pid, mainBreakpoint, mainVal);
   
   println!("[main] I'll be waiting for the child termination...");
   match waitpid(pid, None) {
@@ -155,8 +165,6 @@ fn getMainProcBaseAddr(mapping: &String) -> u64 {
   let offsets: Vec<&str> = splittedMapping[0].split("-").collect();
   let baseAddr = offsets[0];
   let addr = u64::from_str_radix(baseAddr, 16).unwrap();
-
-  println!("base addr -> {}", addr);
   return addr;
 
 
