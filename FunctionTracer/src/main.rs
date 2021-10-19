@@ -13,15 +13,26 @@ use linux_personality::personality;
 use goblin::{error, elf};
 use goblin::elf::sym::*;
 use libc::*;
+use iced_x86::{Decoder, DecoderOptions, Formatter, Instruction, NasmFormatter};
+
+struct Area {
+	filename: String,
+	baseAddr: u64,
+	endAddr: u64,
+	symbols: HashMap<u64, String>,
+}
 
 fn elfParser(target: &String) -> HashMap<String, u64> {
 	let mut addrToSym: HashMap<String, u64> = HashMap::new();
   let path = path::Path::new(target.as_str());
   let buffer = fs::read(target).unwrap();
+	println!("Parsing {} target", target);
   let elf = elf::Elf::parse(&buffer).expect("File not parsed correctly");
 
   for sym in elf.syms.iter() {
-  	if let Some(Ok(str)) = elf.strtab.get(sym.st_name) {
+		//println!("{}", sym.st_name);
+		if let Some(Ok(str)) = elf.strtab.get(sym.st_name) {
+			//println!("{}", str);
     	if sym.st_value == 0 {
       	let dyn_addr = unsafe {
         	libc::dlsym(libc::RTLD_DEFAULT, CString::new(str).unwrap().as_ptr())
@@ -34,9 +45,89 @@ fn elfParser(target: &String) -> HashMap<String, u64> {
     	} 
     } 
   }
+
+  for sym in elf.dynsyms.iter() {
+		//println!("{}", sym.st_name);
+  	if let Some(Ok(str)) = elf.dynstrtab.get(sym.st_name) {
+			//println!("{}", str);
+    	if sym.st_value == 0 {
+      	let dyn_addr = unsafe {
+        	libc::dlsym(libc::RTLD_DEFAULT, CString::new(str).unwrap().as_ptr())
+      	};
+      	if !dyn_addr.is_null() {
+      		addrToSym.insert(str.to_owned(), dyn_addr as u64);
+      	}
+    	} else {
+    		addrToSym.insert(str.to_owned(), sym.st_value);
+    	} 
+    } 
+  }
+	
+	println!("Retrieved {} symbols", addrToSym.keys().len());
+
   return addrToSym;
 }
 
+fn libraryParser(target: &String) -> HashMap<u64, String> {
+	let mut addrToSym: HashMap<u64, String> = HashMap::new();
+  let path = path::Path::new(target.as_str());
+  let buffer = fs::read(target).unwrap();
+	println!("Parsing {} target", target);
+  let elf = elf::Elf::parse(&buffer).expect("File not parsed correctly");
+
+  for sym in elf.syms.iter() {
+		//println!("{}", sym.st_name);
+		if let Some(Ok(str)) = elf.strtab.get(sym.st_name) {
+			//println!("{}", str);
+    	if sym.st_value == 0 {
+      	let dyn_addr = unsafe {
+        	libc::dlsym(libc::RTLD_DEFAULT, CString::new(str).unwrap().as_ptr())
+      	};
+      	if !dyn_addr.is_null() {
+      		addrToSym.insert(dyn_addr as u64, str.to_owned());
+      	}
+    	} else {
+    		addrToSym.insert(sym.st_value, str.to_owned());
+    	} 
+    } 
+  }
+
+  for sym in elf.dynsyms.iter() {
+		//println!("{}", sym.st_name);
+  	if let Some(Ok(str)) = elf.dynstrtab.get(sym.st_name) {
+			//println!("{}", str);
+    	if sym.st_value == 0 {
+      	let dyn_addr = unsafe {
+        	libc::dlsym(libc::RTLD_DEFAULT, CString::new(str).unwrap().as_ptr())
+      	};
+      	if !dyn_addr.is_null() {
+      		addrToSym.insert(dyn_addr as u64, str.to_owned());
+      	}
+    	} else {
+    		addrToSym.insert(sym.st_value, str.to_owned());
+    	} 
+    } 
+  }
+	
+	println!("Retrieved {} symbols", addrToSym.keys().len());
+
+  return addrToSym;
+}
+
+
+fn readMemory(pid: Pid, addr: u64) -> Vec<u8> {
+	//reads a total of 32 bytes, assuming the machine is little endin (le)
+	let mut code: Vec<u8> = Vec::new();
+	for i in 0..2 {
+    let value = ptrace::read(pid, addr as *mut c_void).expect("Error reading memory");
+		let bytes = value.to_le_bytes();
+		for b in &bytes {
+			code.push(*b);
+		}
+
+	}
+	return code;
+}
 
 fn setBreakpoint(pid: Pid, addr: u64) -> i64 {
     let value = ptrace::read(pid, addr as *mut c_void).expect("Error reading memory");
@@ -54,9 +145,37 @@ fn restore_breakpoint(pid: Pid, addr: u64, orig_value: i64) {
     }
 }
 
+fn analyseMemoryMapping(pid: Pid) -> Vec<Area> {
+		let mut memoryMappings: Vec<Area> = Vec::new();
+		let mut files: Vec<String> = vec![];
+		let mapping: String = getAddressSpace(pid);
+		let lines: Vec<_> = mapping.lines().collect();
+		for line in &lines {
+		  let splittedLine: Vec<&str> = line.split(" ").collect();
+			let filename: String = splittedLine.last().copied().unwrap().to_string();
+			if files.contains(&filename) || !path::Path::new(&filename).exists(){
+				continue;
+			}
+			files.push(filename.clone());
+			println!("Fetched name -> {}" , filename);
+		  let offsets: Vec<&str> = splittedLine[0].split("-").collect();
+		  let baseAddr = offsets[0];
+			let endAddr = offsets[1];
+				
+		  let base = u64::from_str_radix(baseAddr, 16).unwrap();
+		  let end = u64::from_str_radix(endAddr, 16).unwrap();
+			let symbols: HashMap<_,_> = libraryParser(&filename);	
+			let boxedArea: Box<Area> = Box::new(Area {filename: filename, baseAddr: base, endAddr: end, symbols: symbols}); 
+			memoryMappings.push(*boxedArea);
+		}
+		
+		return memoryMappings;
+}
+
 //fn handle_sigstop(pid: Pid, saved_values: &HashMap<u64, i64>) {
-fn handle_sigstop(pid: Pid, addr: u64, val: i64) {
+fn handle_sigstop(pid: Pid, addr: u64, val: i64) -> bool {
     let mut regs = ptrace::getregs(pid).unwrap();
+		let mut isMain : bool = false;
 
 		if (regs.rip - 1) == addr {
 
@@ -64,6 +183,7 @@ fn handle_sigstop(pid: Pid, addr: u64, val: i64) {
 			restore_breakpoint(pid, regs.rip - 1, val);
 			regs.rip -= 1;
 			ptrace::setregs(pid, regs).expect("Error resetting RIP");
+			isMain = true;
 		}
     //match saved_values.get(&(regs.rip - 1)) {
     //    Some(orig) => {
@@ -78,24 +198,70 @@ fn handle_sigstop(pid: Pid, addr: u64, val: i64) {
     //}
 
     //ptrace::cont(pid, None).expect("Restoring breakpoint failed");
-    ptrace::step(pid, None);
-
+		return isMain;
 }
 
 
+fn disassembleIP(pid: Pid) {
+		println!("Disassembling code to look for a call instruction");
+    let mut regs = ptrace::getregs(pid).unwrap();
+		let code: Vec<u8> = readMemory(pid, regs.rip);
+    let mut decoder =
+        Decoder::with_ip(64, &code, regs.rip, DecoderOptions::NONE);
+		    let mut formatter = NasmFormatter::new();
+
+    // Change some options, there are many more
+    formatter.options_mut().set_digit_separator("`");
+    formatter.options_mut().set_first_operand_char_index(10);
+
+    // String implements FormatterOutput
+    let mut output = String::new();
+
+    // Initialize this outside the loop because decode_out() writes to every field
+    let mut instruction = Instruction::default();
+
+    // The decoder also implements Iterator/IntoIterator so you could use a for loop:
+    //      for instruction in &mut decoder { /* ... */ }
+    // or collect():
+    //      let instructions: Vec<_> = decoder.into_iter().collect();
+    // but can_decode()/decode_out() is a little faster:
+    while decoder.can_decode() {
+        // There's also a decode() method that returns an instruction but that also
+        // means it copies an instruction (40 bytes):
+        //     instruction = decoder.decode();
+        decoder.decode_out(&mut instruction);
+
+        // Format the instruction ("disassemble" it)
+        output.clear();
+        formatter.format(&instruction, &mut output);
+
+        // Eg. "00007FFAC46ACDB2 488DAC2400FFFFFF     lea       rbp,[rsp-100h]"
+        print!("{:016X} ", instruction.ip());
+        let start_index = (instruction.ip() - regs.rip) as usize;
+        let instr_bytes = &code[start_index..start_index + instruction.len()];
+        for b in instr_bytes.iter() {
+            print!("{:02X}", b);
+        }
+
+        println!(" {}", output);
+    }
+		
+}
+
 fn eventsManager(pid: Pid, breakpointMainAddr: u64, valMainAddr: i64) {
-	let mut isMainHit: bool = false;
+	let mut memoryMappings: Vec<Area> = Vec::new();
 	loop {
 		match wait() {
 	  	Ok(WaitStatus::Stopped(pid_t, sig_num)) => {
 	    	match sig_num {
 	      	Signal::SIGTRAP => {
 	        	//handle_sigstop(pid_t, &saved_values);
-	        	handle_sigstop(pid_t, breakpointMainAddr, valMainAddr);
-						if !isMainHit {
-							getLibraryCalls(pid);
-							isMainHit = true;
+	        	let isMain: bool = handle_sigstop(pid_t, breakpointMainAddr, valMainAddr);
+						if isMain {
+							memoryMappings = analyseMemoryMapping(pid);
 						}
+						disassembleIP(pid);
+    				ptrace::step(pid, None);
 	        }
 	                    
 	        Signal::SIGSEGV => {
@@ -126,12 +292,16 @@ fn eventsManager(pid: Pid, breakpointMainAddr: u64, valMainAddr: i64) {
 	    },
 
 			_ => {
+
 				ptrace::step(pid, None);
+
 				// get rip and if it points to a call, extract the address, get the corresponding symbols and prints it
 			}
 	  }
 	}
 }
+
+
 
 fn getLibraryCalls(pid: Pid) {
 	getAddressSpace(pid);
