@@ -13,7 +13,7 @@ use linux_personality::personality;
 use goblin::{error, elf};
 use goblin::elf::sym::*;
 use libc::*;
-use iced_x86::{Decoder, DecoderOptions, Formatter, Instruction, NasmFormatter};
+use iced_x86::{Decoder, DecoderOptions, Formatter, Instruction, NasmFormatter, FlowControl, InstructionInfoFactory};
 
 struct Area {
 	filename: String,
@@ -203,47 +203,57 @@ fn handle_sigstop(pid: Pid, addr: u64, val: i64) -> bool {
 
 
 fn disassembleIP(pid: Pid) {
-		println!("Disassembling code to look for a call instruction");
+		//println!("Disassembling code to look for a call instruction");
     let mut regs = ptrace::getregs(pid).unwrap();
 		let code: Vec<u8> = readMemory(pid, regs.rip);
     let mut decoder =
         Decoder::with_ip(64, &code, regs.rip, DecoderOptions::NONE);
 		    let mut formatter = NasmFormatter::new();
 
-    // Change some options, there are many more
     formatter.options_mut().set_digit_separator("`");
     formatter.options_mut().set_first_operand_char_index(10);
 
-    // String implements FormatterOutput
     let mut output = String::new();
 
-    // Initialize this outside the loop because decode_out() writes to every field
     let mut instruction = Instruction::default();
+		let mut info_factory = InstructionInfoFactory::new();
 
-    // The decoder also implements Iterator/IntoIterator so you could use a for loop:
-    //      for instruction in &mut decoder { /* ... */ }
-    // or collect():
-    //      let instructions: Vec<_> = decoder.into_iter().collect();
-    // but can_decode()/decode_out() is a little faster:
     while decoder.can_decode() {
-        // There's also a decode() method that returns an instruction but that also
-        // means it copies an instruction (40 bytes):
-        //     instruction = decoder.decode();
         decoder.decode_out(&mut instruction);
 
-        // Format the instruction ("disassemble" it)
         output.clear();
-        formatter.format(&instruction, &mut output);
+				match instruction.flow_control() {
 
-        // Eg. "00007FFAC46ACDB2 488DAC2400FFFFFF     lea       rbp,[rsp-100h]"
-        print!("{:016X} ", instruction.ip());
-        let start_index = (instruction.ip() - regs.rip) as usize;
-        let instr_bytes = &code[start_index..start_index + instruction.len()];
-        for b in instr_bytes.iter() {
-            print!("{:02X}", b);
-        }
+					FlowControl::Call => {	
+						let info = info_factory.info(&instruction);
+						let offsets = decoder.get_constant_offsets(&instruction);
+        		let start_index = (instruction.ip() - regs.rip) as usize;
+        		let instr_bytes = &code[start_index..start_index + instruction.len()];
+						println!("Instruction type -> {:?}", instruction.mnemonic());
+        		for b in offsets.immediate_offset()..offsets.immediate_offset()+offsets.immediate_size() {
+        		    print!("{:02X}", instr_bytes[b]);
+        		}
+						println!("");
 
-        println!(" {}", output);
+
+        		formatter.format(&instruction, &mut output);
+
+        		// Eg. "00007FFAC46ACDB2 488DAC2400FFFFFF     lea       rbp,[rsp-100h]"
+        		print!("{:016X} ", instruction.ip());
+        		let start_index = (instruction.ip() - regs.rip) as usize;
+        		let instr_bytes = &code[start_index..start_index + instruction.len()];
+						let instr_string = String::from("");
+        		for b in instr_bytes.iter() {
+        		    print!("{:02X}", b);
+        		}
+
+        		println!(" {}", output);
+					},
+					_ => {()},
+				}
+
+
+
     }
 		
 }
@@ -292,9 +302,7 @@ fn eventsManager(pid: Pid, breakpointMainAddr: u64, valMainAddr: i64) {
 	    },
 
 			_ => {
-
 				ptrace::step(pid, None);
-
 				// get rip and if it points to a call, extract the address, get the corresponding symbols and prints it
 			}
 	  }
@@ -393,9 +401,6 @@ fn main() {
         panic!("[main] fork() failed: {}", err);
     }
 
-  }
-
- 
-    
+  }    
   return;
 }
